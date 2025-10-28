@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plant Health Monitor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 50px;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <h1>Plant Health Monitor</h1>
+    <button id="capture-button">Capture Image</button>
+    <div id="results">
+        <h2>Results:</h2>
+        <img id="ndvi-image" src="" alt="NDVI Image" style="display:none;">
+    </div>
+
+    <script>
+        document.getElementById('capture-button').addEventListener('click', function() {
+            fetch('/capture')
+                .then(response => response.json())
+                .then(data => {
+                    const ndviImage = document.getElementById('ndvi-image');
+                    ndviImage.src = data.image_url;
+                    ndviImage.style.display = 'block';
+                })
+                .catch(error => console.error('Error capturing image:', error));
+        });
+    </script>
+</body>
+</html>
