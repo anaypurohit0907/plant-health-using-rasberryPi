@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
 STREAM_MAX_FPS = int(os.getenv('STREAM_MAX_FPS', '8'))            # throttle FPS to reduce CPU
 STREAM_WIDTH = int(os.getenv('STREAM_WIDTH', '640'))               # resize width for stream
 STREAM_JPEG_QUALITY = int(os.getenv('STREAM_JPEG_QUALITY', '70'))  # 0-100
+STREAM_HEARTBEAT_SEC = float(os.getenv('STREAM_HEARTBEAT_SEC', '10'))  # send a keep-alive frame at least this often
 
 # Initialize camera handles (actual setup in _ensure_camera_or_demo)
 camera = None                 # OpenCV VideoCapture instance or None
@@ -229,8 +230,16 @@ def capture():
 
 @app.route('/video_feed')
 def video_feed():
+    # Prebuild a tiny heartbeat JPEG to keep the stream alive if needed
+    hb_img = np.zeros((2, 2, 3), dtype=np.uint8)
+    _, hb_jpeg = cv2.imencode(
+        '.jpg', hb_img,
+        [int(cv2.IMWRITE_JPEG_QUALITY), max(1, min(30, STREAM_JPEG_QUALITY))]
+    )
+
     def generate():
         frame_interval = 1.0 / max(1, STREAM_MAX_FPS)
+        last_yield = time.time()
         while True:
             loop_start = time.time()
             try:
@@ -242,9 +251,14 @@ def video_feed():
                 )
                 if not ok:
                     logging.error("JPEG encode failed.")
-                    continue
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                    # Fall back to heartbeat
+                    chunk = (b'--frame\r\n'
+                             b'Content-Type: image/jpeg\r\n\r\n' + hb_jpeg.tobytes() + b'\r\n')
+                else:
+                    chunk = (b'--frame\r\n'
+                             b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                yield chunk
+                last_yield = time.time()
             except GeneratorExit:
                 logging.info("Client disconnected from video_feed.")
                 break
@@ -252,13 +266,33 @@ def video_feed():
                 logging.info("Broken pipe in video_feed; stopping stream.")
                 break
             except Exception as e:
-                logging.exception("Video feed error: %s", e)
-                break
+                # Don't immediately drop the stream; yield a heartbeat and try again
+                logging.warning("Video feed error: %s; sending heartbeat and continuing", e)
+                try:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + hb_jpeg.tobytes() + b'\r\n')
+                    last_yield = time.time()
+                except Exception:
+                    break
             finally:
                 elapsed = time.time() - loop_start
                 if elapsed < frame_interval:
                     time.sleep(frame_interval - elapsed)
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                # Ensure periodic heartbeat to avoid idle timeouts by proxies
+                if (time.time() - last_yield) > max(frame_interval, STREAM_HEARTBEAT_SEC):
+                    try:
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + hb_jpeg.tobytes() + b'\r\n')
+                        last_yield = time.time()
+                    except Exception:
+                        break
+    resp = Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Advise proxies/servers not to buffer and to keep connection alive
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Connection'] = 'keep-alive'
+    resp.headers['X-Accel-Buffering'] = 'no'  # for nginx
+    return resp
 
 # Validate camera on startup
 _ensure_camera_or_demo()
