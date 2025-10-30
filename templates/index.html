@@ -71,7 +71,8 @@
 
                 // NDVI image
                 const ndviImage = document.getElementById('ndvi-image');
-                ndviImage.src = data.ndvi_image;
+                // Bust cache so the browser fetches the newly saved file
+                ndviImage.src = data.ndvi_image + '?t=' + Date.now();
                 ndviImage.style.display = 'block';
 
                 // Health info

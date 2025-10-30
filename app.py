@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
 STREAM_MAX_FPS = int(os.getenv('STREAM_MAX_FPS', '8'))            # throttle FPS to reduce CPU
 STREAM_WIDTH = int(os.getenv('STREAM_WIDTH', '640'))               # resize width for stream
 STREAM_JPEG_QUALITY = int(os.getenv('STREAM_JPEG_QUALITY', '70'))  # 0-100
-STREAM_HEARTBEAT_SEC = float(os.getenv('STREAM_HEARTBEAT_SEC', '10'))  # send a keep-alive frame at least this often
+STREAM_HEARTBEAT_SEC = float(os.getenv('STREAM_HEARTBEAT_SEC', '100'))  # send a keep-alive frame at least this often
 
 # Initialize camera handles (actual setup in _ensure_camera_or_demo)
 camera = None                 # OpenCV VideoCapture instance or None
