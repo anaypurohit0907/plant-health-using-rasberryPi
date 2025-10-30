@@ -10,6 +10,11 @@
             text-align: center;
             margin: 50px;
         }
+        .row { display: flex; gap: 24px; justify-content: center; align-items: flex-start; flex-wrap: wrap; }
+        .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; max-width: 520px; }
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+        .badge.demo { background: #eee; color: #333; }
+        .badge.live { background: #e6f7ff; color: #0366d6; }
         img {
             max-width: 100%;
             height: auto;
@@ -20,27 +25,74 @@
             font-size: 16px;
             cursor: pointer;
         }
+        #health { font-size: 18px; margin-top: 12px; }
     </style>
 </head>
 <body>
-    <h1>Plant Health Monitor</h1>
-    <button id="capture-button">Capture Image</button>
-    <div id="results">
-        <h2>Results:</h2>
-        <img id="ndvi-image" src="" alt="NDVI Image" style="display:none;">
+    <h1>Plant Health Monitor <span id="mode-badge" class="badge">&nbsp;</span></h1>
+
+    <div class="row">
+        <div class="card">
+            <h2>Live Feed</h2>
+            <img id="video" src="/video_feed" alt="Live camera or demo feed">
+        </div>
+        <div class="card">
+            <h2>NDVI Analysis</h2>
+            <button id="capture-button">Capture & Analyze</button>
+            <div id="health" style="display:none;">
+                <div><strong>Health Score:</strong> <span id="health-score"></span> (<span id="health-label"></span>)</div>
+            </div>
+            <img id="ndvi-image" src="" alt="NDVI Image" style="display:none;">
+        </div>
     </div>
 
     <script>
-        document.getElementById('capture-button').addEventListener('click', function() {
-            fetch('/capture')
-                .then(response => response.json())
-                .then(data => {
-                    const ndviImage = document.getElementById('ndvi-image');
-                    ndviImage.src = data.image_url;
-                    ndviImage.style.display = 'block';
-                })
-                .catch(error => console.error('Error capturing image:', error));
-        });
+        function setModeBadge(demo) {
+            const badge = document.getElementById('mode-badge');
+            if (demo) {
+                badge.textContent = 'DEMO MODE';
+                badge.className = 'badge demo';
+                badge.style.display = 'inline-block';
+            } else {
+                badge.textContent = 'LIVE CAMERA';
+                badge.className = 'badge live';
+                badge.style.display = 'inline-block';
+            }
+        }
+
+        async function capture() {
+            try {
+                const res = await fetch('/capture');
+                const data = await res.json();
+                if (!data.ok) throw new Error(data.error || 'Capture failed');
+
+                // Mode badge
+                setModeBadge(Boolean(data.demo_mode));
+
+                // NDVI image
+                const ndviImage = document.getElementById('ndvi-image');
+                ndviImage.src = data.ndvi_image;
+                ndviImage.style.display = 'block';
+
+                // Health info
+                const healthWrap = document.getElementById('health');
+                const scoreEl = document.getElementById('health-score');
+                const labelEl = document.getElementById('health-label');
+                if (data.health) {
+                    scoreEl.textContent = data.health.score;
+                    labelEl.textContent = data.health.label;
+                    healthWrap.style.display = 'block';
+                }
+            } catch (err) {
+                console.error('Error capturing image:', err);
+                alert('Capture error: ' + err.message);
+            }
+        }
+
+        document.getElementById('capture-button').addEventListener('click', capture);
+
+        // Initialize mode badge as unknown; it will be set after first capture
+        setModeBadge(false);
     </script>
 </body>
 </html>
