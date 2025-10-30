@@ -4,14 +4,30 @@ import numpy as np
 import os
 import logging
 import random
+import time
+
+# Try to import Picamera2 (Raspberry Pi). If not available, we'll fall back to OpenCV.
+try:
+    from picamera2 import Picamera2  # type: ignore
+    PICAMERA2_AVAILABLE = True
+except Exception:
+    Picamera2 = None  # type: ignore
+    PICAMERA2_AVAILABLE = False
 
 app = Flask(__name__)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-# Initialize the camera (will be validated below)
-camera = cv2.VideoCapture(0)
+# Stream performance/config controls (override via env on Pi if needed)
+STREAM_MAX_FPS = int(os.getenv('STREAM_MAX_FPS', '8'))            # throttle FPS to reduce CPU
+STREAM_WIDTH = int(os.getenv('STREAM_WIDTH', '640'))               # resize width for stream
+STREAM_JPEG_QUALITY = int(os.getenv('STREAM_JPEG_QUALITY', '70'))  # 0-100
+
+# Initialize camera handles (actual setup in _ensure_camera_or_demo)
+camera = None                 # OpenCV VideoCapture instance or None
+picam2 = None                 # Picamera2 instance or None
+USING_PICAM2 = False
 
 # Demo mode state
 DEMO_MODE = False
@@ -33,30 +49,70 @@ def _init_demo_images() -> None:
     # Sort by modification time (latest last) to have deterministic rotation
     DEMO_IMAGES = sorted(candidates, key=lambda p: os.path.getmtime(p))
 
+def _init_picamera2() -> None:
+    """Attempt to initialize Picamera2 for Raspberry Pi."""
+    global picam2, USING_PICAM2
+    if not PICAMERA2_AVAILABLE:
+        raise RuntimeError("Picamera2 module not available")
+    picam2 = Picamera2()
+    # Configure a modest video resolution to limit CPU usage
+    width = STREAM_WIDTH if STREAM_WIDTH else 640
+    video_config = picam2.create_video_configuration(main={"size": (int(width), int(width * 3 / 4))})
+    picam2.configure(video_config)
+    picam2.start()
+    # Try one capture to validate
+    _ = picam2.capture_array()
+    USING_PICAM2 = True
+    logging.info("Picamera2 initialized successfully.")
+
+
+def _init_opencv_camera() -> None:
+    """Attempt to initialize OpenCV VideoCapture camera."""
+    global camera, USING_PICAM2
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("OpenCV camera not opened")
+    # Try a read to confirm
+    ret, _ = cap.read()
+    if not ret:
+        cap.release()
+        raise RuntimeError("OpenCV camera read failed")
+    camera = cap
+    USING_PICAM2 = False
+    logging.info("OpenCV VideoCapture initialized successfully.")
+
+
 def _ensure_camera_or_demo():
-    """Validate camera availability; if unavailable, enable DEMO_MODE and load demo images."""
+    """Validate camera availability; prefer Picamera2 on Pi, else OpenCV; fallback to DEMO_MODE."""
     global DEMO_MODE
+    # Try Picamera2 first if available
     try:
-        if not camera.isOpened():
-            raise RuntimeError("Camera not opened")
-        # Try one read to confirm
-        ret, _ = camera.read()
-        if not ret:
-            raise RuntimeError("Camera read failed")
-        logging.info("Camera initialized successfully.")
+        if PICAMERA2_AVAILABLE:
+            _init_picamera2()
+            return
     except Exception as e:
-        logging.warning("Camera unavailable: %s. Switching to DEMO_MODE.", e)
-        DEMO_MODE = True
-        _init_demo_images()
-        if not DEMO_IMAGES:
-            logging.error("DEMO_MODE active but no demo images found in '%s'", _static_dir())
+        logging.warning("Picamera2 init failed: %s", e)
+
+    # Fall back to OpenCV
+    try:
+        _init_opencv_camera()
+        return
+    except Exception as e:
+        logging.warning("OpenCV camera init failed: %s", e)
+
+    # Final fallback: DEMO_MODE
+    logging.warning("No camera available. Switching to DEMO_MODE.")
+    DEMO_MODE = True
+    _init_demo_images()
+    if not DEMO_IMAGES:
+        logging.error("DEMO_MODE active but no demo images found in '%s'", _static_dir())
 
 def read_image_from_camera():
     """Capture an image from the camera or return a demo image if DEMO_MODE is active.
 
     On camera read failure at runtime, automatically switch to DEMO_MODE.
     """
-    global _demo_index, DEMO_MODE
+    global _demo_index, DEMO_MODE, USING_PICAM2
     if DEMO_MODE:
         if not DEMO_IMAGES:
             raise RuntimeError("DEMO_MODE active but no demo images available in static/")
@@ -69,14 +125,36 @@ def read_image_from_camera():
         return img
 
     # Normal camera mode
-    ret, frame = camera.read()
-    if not ret or frame is None:
-        logging.error("Camera read failed during runtime. Switching to DEMO_MODE.")
+    try:
+        if USING_PICAM2 and picam2 is not None:
+            # Picamera2 returns RGB; convert to BGR for OpenCV processing
+            rgb = picam2.capture_array()
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            if camera is None:
+                raise RuntimeError("Camera not initialized")
+            ret, frame = camera.read()
+            if not ret or frame is None:
+                raise RuntimeError("OpenCV camera read failed")
+        return frame
+    except Exception as e:
+        logging.error("Camera read failed during runtime (%s). Switching to DEMO_MODE.", e)
         DEMO_MODE = True
         _init_demo_images()
         if not DEMO_IMAGES:
             raise RuntimeError("Camera read failed and no demo images available in static/.")
         return read_image_from_camera()
+
+
+def _prep_frame_for_stream(frame: np.ndarray) -> np.ndarray:
+    """Resize frame for streaming to reduce CPU/bandwidth."""
+    if frame is None:
+        return frame
+    if STREAM_WIDTH and frame.shape[1] > STREAM_WIDTH:
+        h, w = frame.shape[:2]
+        scale = STREAM_WIDTH / float(w)
+        new_size = (int(STREAM_WIDTH), int(h * scale))
+        frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
     return frame
 
 def contrast_stretch(im: np.ndarray, out_min: float = 0.0, out_max: float = 255.0,
@@ -152,15 +230,34 @@ def capture():
 @app.route('/video_feed')
 def video_feed():
     def generate():
+        frame_interval = 1.0 / max(1, STREAM_MAX_FPS)
         while True:
+            loop_start = time.time()
             try:
                 frame = read_image_from_camera()
-            except Exception as e:
-                logging.exception("Video feed read failed: %s", e)
+                frame = _prep_frame_for_stream(frame)
+                ok, jpeg = cv2.imencode(
+                    '.jpg', frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(STREAM_JPEG_QUALITY)]
+                )
+                if not ok:
+                    logging.error("JPEG encode failed.")
+                    continue
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            except GeneratorExit:
+                logging.info("Client disconnected from video_feed.")
                 break
-            _, jpeg = cv2.imencode('.jpg', frame)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            except BrokenPipeError:
+                logging.info("Broken pipe in video_feed; stopping stream.")
+                break
+            except Exception as e:
+                logging.exception("Video feed error: %s", e)
+                break
+            finally:
+                elapsed = time.time() - loop_start
+                if elapsed < frame_interval:
+                    time.sleep(frame_interval - elapsed)
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # Validate camera on startup
@@ -168,11 +265,17 @@ _ensure_camera_or_demo()
 
 if __name__ == '__main__':
     try:
-        app.run(host='0.0.0.0', port=5000, debug=True)
+        # Avoid debug/reloader to reduce duplicate processes and CPU on Pi
+        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
     finally:
         try:
-            if camera:
+            if camera is not None:
                 camera.release()
+        except Exception:
+            pass
+        try:
+            if picam2 is not None:
+                picam2.stop()
         except Exception:
             pass
         try:
